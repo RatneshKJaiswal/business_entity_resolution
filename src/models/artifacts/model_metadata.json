@@ -1,0 +1,12 @@
+{
+  "best_tau": 0.9000000000000002,
+  "best_macro_f05": 0.8314296894681755,
+  "precision": 0.9666798107255521,
+  "recall": 0.7002285061411025,
+  "singleton_accuracy": 0.875,
+  "val_sample_size": 2000,
+  "total_sample_size": 10000,
+  "cv_tuning_performed": false,
+  "winning_hyperparams": null,
+  "cv_metrics": null
+}
