@@ -32,7 +32,7 @@ MODEL_SAVE_PATH = ARTIFACTS_DIR / "lightgbm_er_model.txt"
 MODEL_METADATA_PATH = ARTIFACTS_DIR / "model_metadata.json"
 
 # Candidate Generation (Blocking) Hyperparameters
-MAX_CANDIDATES_PER_S1 = 75  # Increased to 75 for >90% recall coverage
+MAX_CANDIDATES_PER_S1 = 300
 MIN_TOKEN_LEN = 2
 
 # Classifier & Metric Hyperparameters

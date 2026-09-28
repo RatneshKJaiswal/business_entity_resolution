@@ -34,9 +34,18 @@ from src.utils.io_utils import (
     load_ground_truth,
     write_submission_tsv
 )
-from src.blocking.candidate_builder import CandidateBuilder, FALLBACK_COUNTRY
+from src.utils.evaluator import compute_macro_f05
+from src.blocking.candidate_builder import (
+    CandidateBuilder,
+    FALLBACK_COUNTRY,
+    prune_training_candidates
+)
 from src.features.feature_pipeline import FeaturePipeline
-from src.models.train_lgbm import train_lightgbm_model, load_lightgbm_model
+from src.models.train_lgbm import (
+    label_candidate_pairs,
+    train_lightgbm_model,
+    load_lightgbm_model
+)
 from src.models.tuner import run_kfold_hyperparameter_tuning
 from src.models.inference import predict_pair_probabilities
 from src.postprocessing.threshold_optimizer import find_optimal_threshold
@@ -139,8 +148,11 @@ def run_training_stage(
     all_countries_target = set(df_target["country"].fillna("").unique())
     known_countries = sorted({c for c in (all_countries_s1 | all_countries_target) if c and c.strip()})
     
-    # Check if any target entities have missing country
-    has_fallback = df_target["country"].fillna("").eq("").any()
+    # Include the fallback partition when either side contains missing countries.
+    has_fallback = (
+        df_s1["country"].fillna("").eq("").any()
+        or df_target["country"].fillna("").eq("").any()
+    )
     
     partitions = known_countries[:]
     if has_fallback:
@@ -177,25 +189,13 @@ def run_training_stage(
                     if tm in target_ids_set and tm not in cand_list:
                         cand_list.append(tm)
 
-            # EFFICIENT TRAINING NEGATIVE PRUNING:
-            # Keep ALL true positives, and keep up to 8 hard negative candidates per S1 entity.
-            # This slashes training pairs from 35M to ~10M, preventing MemoryError and speeding up feature extraction 4x
-            for s1_id, cand_list in cand_map_tr.items():
-                true_matches = gt_map.get(s1_id, set())
-                pos = [c for c in cand_list if c in true_matches]
-                neg = [c for c in cand_list if c not in true_matches]
-                if len(neg) > 30:
-                    neg = neg[:30]
-                cand_map_tr[s1_id] = pos + neg
+            cand_map_tr = prune_training_candidates(cand_map_tr, gt_map)
 
             feat_df_tr = FeaturePipeline.extract_features_for_pairs(
                 cand_map_tr, df_s1_tr_c, df_target_c, country=country if country != FALLBACK_COUNTRY else ""
             )
             if not feat_df_tr.empty:
-                feat_df_tr["label"] = feat_df_tr.apply(
-                    lambda r: 1 if r["candidate_entity_id"] in gt_map.get(r["source1_entity_id"], set()) else 0,
-                    axis=1
-                )
+                label_candidate_pairs(feat_df_tr, gt_map)
                 train_feature_dfs.append(feat_df_tr)
 
         # Validation partition candidates (simulate unseen test set, NO ground truth injection)
@@ -267,6 +267,7 @@ def run_training_stage(
         print("WARNING: No validation features extracted. Using default threshold.")
         best_tau = MATCH_THRESHOLD
         best_f05 = 0.0
+        country_thresholds = {}
     else:
         full_val_df = pd.concat(val_feature_dfs, ignore_index=True)
         val_scored_df = predict_pair_probabilities(full_val_df, model=clf.booster_)
@@ -278,11 +279,62 @@ def run_training_stage(
             ground_truth=gt_map
         )
 
+        country_thresholds = {}
+        val_country_by_s1 = dict(zip(
+            df_s1_val["entity_id"],
+            df_s1_val["country"].fillna("").astype(str)
+        ))
+        for country in sorted(set(val_country_by_s1.values())):
+            country_s1_ids = [
+                s1_id for s1_id in val_s1_ids
+                if val_country_by_s1[s1_id] == country
+            ]
+            if len(country_s1_ids) < 1000:
+                continue
+            country_threshold, country_best_f05 = find_optimal_threshold(
+                df_scored_val_pairs=val_scored_df,
+                val_s1_ids=country_s1_ids,
+                ground_truth=gt_map
+            )
+            country_thresholds[country] = country_threshold
+            print(
+                f"  Country threshold {country}: tau={country_threshold:.6f}, "
+                f"Macro F_0.5={country_best_f05:.5f}"
+            )
+
+        proposed_threshold_by_s1 = {
+            s1_id: country_thresholds.get(val_country_by_s1[s1_id], best_tau)
+            for s1_id in val_s1_ids
+        }
+        country_calibrated_preds = select_matches_from_scored_pairs(
+            df_scored_pairs=val_scored_df,
+            all_s1_ids=val_s1_ids,
+            threshold=best_tau,
+            threshold_by_s1=proposed_threshold_by_s1
+        )
+        country_calibrated_f05 = compute_macro_f05(
+            country_calibrated_preds, gt_map, entity_subset=val_s1_ids
+        )
+        print(
+            f"Country-calibrated validation Macro F_0.5: "
+            f"{country_calibrated_f05:.5f} "
+            f"(pooled threshold: {best_f05:.5f})"
+        )
+        if country_calibrated_f05 > best_f05:
+            threshold_by_s1 = proposed_threshold_by_s1
+            best_f05 = country_calibrated_f05
+            print("Using country-specific thresholds: validation score improved.")
+        else:
+            country_thresholds = {}
+            threshold_by_s1 = None
+            print("Using pooled threshold: country thresholds did not improve validation.")
+
         # Compute detailed validation report
         best_preds = select_matches_from_scored_pairs(
             df_scored_pairs=val_scored_df,
             all_s1_ids=val_s1_ids,
-            threshold=best_tau
+            threshold=best_tau,
+            threshold_by_s1=threshold_by_s1
         )
 
         singleton_correct = 0
@@ -313,7 +365,9 @@ def run_training_stage(
         print("-----------------------------------------------------------------")
         print("VALIDATION RESULTS SUMMARY (Held-out 20% Split):")
         print(f"  * Validation Entities:        {len(val_s1_ids):,}")
-        print(f"  * Optimal Match Threshold:    tau = {best_tau:.2f}")
+        print(f"  * Pooled Match Threshold:     tau = {best_tau:.6f}")
+        for country, country_tau in sorted(country_thresholds.items()):
+            print(f"  * {country or FALLBACK_COUNTRY} Threshold Override: tau = {country_tau:.6f}")
         print(f"  * Best Validation Macro F_0.5: {best_f05:.4f}")
         print(f"  * Non-singleton Precision:    {precision:.4f} (TP={tp_total}, FP={fp_total})")
         print(f"  * Non-singleton Recall:       {recall:.4f} (TP={tp_total}, FN={fn_total})")
@@ -323,6 +377,7 @@ def run_training_stage(
     # Save metadata so prediction stage uses this optimal threshold automatically
     metadata = {
         "best_tau": best_tau,
+        "country_thresholds": country_thresholds,
         "best_macro_f05": best_f05,
         "precision": precision if 'precision' in dir() else 0.0,
         "recall": recall if 'recall' in dir() else 0.0,
@@ -349,13 +404,20 @@ def run_prediction_stage(
     Runs full inference pipeline on the test set:
     Blocking -> Feature Extraction -> LightGBM Prediction -> TSV Outputs
     """
-    # Load optimal threshold from metadata if not explicitly provided
+    country_thresholds = {}
+    # Load calibrated thresholds from metadata unless explicitly overridden.
     if threshold is None:
         if MODEL_METADATA_PATH.exists():
             try:
                 with open(MODEL_METADATA_PATH, "r", encoding="utf-8") as f:
                     meta = json.load(f)
                     threshold = float(meta.get("best_tau", MATCH_THRESHOLD))
+                    raw_country_thresholds = meta.get("country_thresholds", {})
+                    if isinstance(raw_country_thresholds, dict):
+                        country_thresholds = {
+                            str(country): float(country_tau)
+                            for country, country_tau in raw_country_thresholds.items()
+                        }
                     print(f"Loaded calibrated threshold from validation: tau = {threshold:.2f}")
             except Exception:
                 threshold = MATCH_THRESHOLD
@@ -373,6 +435,18 @@ def run_prediction_stage(
     print("  Loading test Source 1 records...")
     df_s1 = load_source_dataframe(s1_path)
     all_s1_ids = df_s1["entity_id"].tolist()
+    if country_thresholds:
+        country_by_s1 = dict(zip(
+            df_s1["entity_id"],
+            df_s1["country"].fillna("").astype(str)
+        ))
+        threshold_by_s1 = {
+            s1_id: country_thresholds.get(country_by_s1[s1_id], threshold)
+            for s1_id in all_s1_ids
+        }
+        print(f"  Applying country-calibrated thresholds for: {sorted(country_thresholds)}")
+    else:
+        threshold_by_s1 = None
     print(f"  Total test Source 1 entities: {len(all_s1_ids):,}")
 
     print("  Loading test Source 2 and Source 3 records...")
@@ -456,7 +530,8 @@ def run_prediction_stage(
     matches = select_matches_from_scored_pairs(
         df_scored_pairs=scored_pairs_df,
         all_s1_ids=all_s1_ids,
-        threshold=threshold
+        threshold=threshold,
+        threshold_by_s1=threshold_by_s1
     )
 
     # 3. Save matching_results.tsv (final scored output)
@@ -483,7 +558,13 @@ def main():
     parser.add_argument("--train", action="store_true", help="Run model training (with automatic 80/20 train/val split and threshold tuning)")
     parser.add_argument("--predict", action="store_true", help="Run test inference and produce output TSVs")
     parser.add_argument("--sample-size", "--train-sample-size", dest="sample_size", type=int, default=250_000, help="Number of S1 train rows to sample (default: 250,000)")
-    parser.add_argument("--whole-data", "--all-data", dest="whole_data", action="store_true", help="Train on all records in the training dataset (all 2.2M S1 and 10.3M targets)")
+    parser.add_argument(
+        "--whole-data",
+        "--all-data",
+        dest="whole_data",
+        action="store_true",
+        help="Use all Source 1 entities; reserve --val-fraction for holdout validation."
+    )
     parser.add_argument("--val-fraction", type=float, default=0.20, help="Fraction of train S1 entities for validation (default: 0.20 for 80/20 split)")
     parser.add_argument("--tune", action="store_true", help="Enable K-Fold Cross Validation and hyperparameter tuning")
     parser.add_argument("--cv-folds", type=int, default=5, help="Number of folds for GroupKFold Cross Validation (default: 5)")
@@ -502,7 +583,7 @@ def main():
     run_pred = args.predict or (not args.train and not args.predict)
 
     if run_train:
-        best_tau = run_training_stage(
+        run_training_stage(
             train_dir=args.train_dir,
             sample_size=effective_sample_size,
             val_fraction=args.val_fraction,
@@ -510,9 +591,6 @@ def main():
             cv_folds=args.cv_folds,
             n_trials=args.n_trials
         )
-        if args.threshold is None:
-            args.threshold = best_tau
-
     if run_pred:
         run_prediction_stage(
             test_dir=args.test_dir,

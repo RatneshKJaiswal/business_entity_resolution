@@ -1,8 +1,6 @@
-"""
-Matcher module applying calibrated decision threshold and source-aware candidate bounds.
-"""
+"""Matcher applying a calibrated threshold to candidates from each target source."""
 
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 from collections import defaultdict
 import pandas as pd
 
@@ -11,12 +9,14 @@ def select_matches_from_scored_pairs(
     df_scored_pairs: pd.DataFrame,
     all_s1_ids: List[str],
     threshold: float = 0.50,
-    max_per_source: int = 10
+    max_per_source: Optional[int] = None,
+    threshold_by_s1: Optional[Dict[str, float]] = None
 ) -> Dict[str, Set[str]]:
     """
     Applies calibrated decision threshold to select matching pairs.
-    Separates candidates by target source (S2 vs S3) and limits to top candidates
-    per source to prevent generic cluster false positives from damaging precision.
+    Separates candidates by target source (S2 vs S3). By default, all candidates
+    above the threshold are retained; an optional per-source limit is available
+    for controlled experiments.
     
     Returns:
         Dict mapping each S1 entity ID to a set of matching S2/S3 entity IDs.
@@ -39,21 +39,28 @@ def select_matches_from_scored_pairs(
 
     for s1_id in all_s1_ids:
         selected: Set[str] = set()
+        entity_threshold = (
+            threshold_by_s1.get(s1_id, threshold)
+            if threshold_by_s1 is not None
+            else threshold
+        )
 
         # Process S2 candidates
         s2_cands = s2_by_s1.get(s1_id, [])
         if s2_cands:
             s2_cands.sort(key=lambda x: x[1], reverse=True)
-            for cand_id, prob in s2_cands[:max_per_source]:
-                if prob >= threshold:
+            selected_s2 = s2_cands if max_per_source is None else s2_cands[:max_per_source]
+            for cand_id, prob in selected_s2:
+                if prob >= entity_threshold:
                     selected.add(cand_id)
 
         # Process S3 candidates
         s3_cands = s3_by_s1.get(s1_id, [])
         if s3_cands:
             s3_cands.sort(key=lambda x: x[1], reverse=True)
-            for cand_id, prob in s3_cands[:max_per_source]:
-                if prob >= threshold:
+            selected_s3 = s3_cands if max_per_source is None else s3_cands[:max_per_source]
+            for cand_id, prob in selected_s3:
+                if prob >= entity_threshold:
                     selected.add(cand_id)
 
         matches[s1_id] = selected

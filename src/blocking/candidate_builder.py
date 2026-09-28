@@ -3,7 +3,7 @@ Candidate Builder coordinating blocking across countries with parallel execution
 Handles entities with missing countries via a fallback partition.
 """
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
 import pandas as pd
@@ -12,23 +12,65 @@ from ..config import N_JOBS, MAX_CANDIDATES_PER_S1
 from ..preprocessing.text_cleaner import strip_legal_suffixes, get_name_tokens
 from ..preprocessing.address_parser import extract_postal_code
 from ..utils.io_utils import write_submission_tsv
-from .inverted_index_blocker import FastInvertedIndexBlocker
+from .inverted_index_blocker import (
+    BLOCKING_CHANNELS,
+    DEFAULT_BLOCKING_CHANNELS,
+    FastInvertedIndexBlocker
+)
 
 FALLBACK_COUNTRY = "__UNKNOWN__"
+
+
+def prune_training_candidates(
+    candidate_mapping: Dict[str, List[str]],
+    ground_truth: Dict[str, Set[str]],
+    max_negatives: int = 30,
+    head_negatives: int = 20
+) -> Dict[str, List[str]]:
+    """Keep all positives and representative high- and lower-ranked negatives."""
+    if max_negatives < 0 or head_negatives < 0:
+        raise ValueError("Negative candidate limits must be non-negative")
+
+    pruned = {}
+    for s1_id, candidates in candidate_mapping.items():
+        true_matches = ground_truth.get(s1_id, set())
+        positives = [candidate for candidate in candidates if candidate in true_matches]
+        negatives = [candidate for candidate in candidates if candidate not in true_matches]
+
+        if len(negatives) > max_negatives:
+            head_count = min(head_negatives, max_negatives)
+            spread_count = max_negatives - head_count
+            selected_negatives = negatives[:head_count]
+            if spread_count:
+                remaining_count = len(negatives) - head_count
+                spread_indices = [
+                    head_count
+                    + round(i * (remaining_count - 1) / max(spread_count - 1, 1))
+                    for i in range(spread_count)
+                ]
+                selected_negatives.extend(negatives[index] for index in spread_indices)
+            negatives = selected_negatives
+
+        pruned[s1_id] = positives + negatives
+    return pruned
+
 
 # Worker function for process pool
 _GLOBAL_BLOCKER = None
 _GLOBAL_FALLBACK_BLOCKER = None
 _GLOBAL_EFFECTIVE_COUNTRY = ""
 _GLOBAL_TOP_K = MAX_CANDIDATES_PER_S1
+_GLOBAL_ENABLED_CHANNELS = DEFAULT_BLOCKING_CHANNELS
 
 
-def _init_worker(blocker, fallback_blocker, effective_country, top_k):
-    global _GLOBAL_BLOCKER, _GLOBAL_FALLBACK_BLOCKER, _GLOBAL_EFFECTIVE_COUNTRY, _GLOBAL_TOP_K
+def _init_worker(blocker, fallback_blocker, effective_country, top_k, enabled_channels):
+    global _GLOBAL_BLOCKER, _GLOBAL_FALLBACK_BLOCKER, _GLOBAL_EFFECTIVE_COUNTRY
+    global _GLOBAL_TOP_K, _GLOBAL_ENABLED_CHANNELS
     _GLOBAL_BLOCKER = blocker
     _GLOBAL_FALLBACK_BLOCKER = fallback_blocker
     _GLOBAL_EFFECTIVE_COUNTRY = effective_country
     _GLOBAL_TOP_K = top_k
+    _GLOBAL_ENABLED_CHANNELS = enabled_channels
 
 
 def _process_s1_batch(batch_records: List[Tuple[str, str, str]]) -> List[Tuple[str, List[str]]]:
@@ -40,11 +82,15 @@ def _process_s1_batch(batch_records: List[Tuple[str, str, str]]) -> List[Tuple[s
         candidates = []
 
         if _GLOBAL_BLOCKER:
-            candidates = _GLOBAL_BLOCKER.retrieve_candidates(cn, tokens, postal, s1_address=addr, top_k=_GLOBAL_TOP_K)
+            candidates = _GLOBAL_BLOCKER.retrieve_candidates(
+                cn, tokens, postal, s1_address=addr, top_k=_GLOBAL_TOP_K,
+                enabled_channels=_GLOBAL_ENABLED_CHANNELS
+            )
 
         if _GLOBAL_FALLBACK_BLOCKER:
             fb_candidates = _GLOBAL_FALLBACK_BLOCKER.retrieve_candidates(
-                cn, tokens, postal, s1_address=addr, top_k=max(10, _GLOBAL_TOP_K // 5)
+                cn, tokens, postal, s1_address=addr, top_k=max(10, _GLOBAL_TOP_K // 5),
+                enabled_channels=_GLOBAL_ENABLED_CHANNELS
             )
             seen = set(candidates)
             for c in fb_candidates:
@@ -88,7 +134,9 @@ class CandidateBuilder:
     def generate_candidates(
         self,
         df_s1: pd.DataFrame,
-        country: str
+        country: str,
+        enabled_channels: Optional[Set[str]] = None,
+        top_k: Optional[int] = None
     ) -> Dict[str, List[str]]:
         """
         Generates candidate IDs for all S1 entities using parallel batch processing.
@@ -110,10 +158,21 @@ class CandidateBuilder:
 
         num_workers = min(N_JOBS, 8)
         results: Dict[str, List[str]] = {}
+        channels = (
+            DEFAULT_BLOCKING_CHANNELS
+            if enabled_channels is None
+            else frozenset(enabled_channels)
+        )
+        candidate_limit = self.top_k if top_k is None else top_k
+        if candidate_limit <= 0:
+            raise ValueError("top_k must be greater than zero")
+        unknown_channels = channels - BLOCKING_CHANNELS
+        if unknown_channels:
+            raise ValueError(f"Unknown blocking channels: {sorted(unknown_channels)}")
 
         # Fallback to single process if running small batches or 1 CPU
         if num_workers <= 1 or len(batches) <= 1:
-            _init_worker(blocker, fallback_blocker, effective_country, self.top_k)
+            _init_worker(blocker, fallback_blocker, effective_country, candidate_limit, channels)
             for batch in tqdm(batches, desc=f"    [b] Blocking candidates ({country})", ncols=100):
                 for s1_id, cands in _process_s1_batch(batch):
                     results[s1_id] = cands
@@ -122,7 +181,7 @@ class CandidateBuilder:
         with ProcessPoolExecutor(
             max_workers=num_workers,
             initializer=_init_worker,
-            initargs=(blocker, fallback_blocker, effective_country, self.top_k)
+            initargs=(blocker, fallback_blocker, effective_country, candidate_limit, channels)
         ) as executor:
             for batch_result in tqdm(
                 executor.map(_process_s1_batch, batches),

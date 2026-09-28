@@ -4,8 +4,9 @@ Uses is_unbalance for class imbalance and group-aware train/val splitting.
 """
 
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Set, Tuple
 import lightgbm as lgb
+import numpy as np
 import pandas as pd
 from sklearn.model_selection import GroupShuffleSplit
 
@@ -35,6 +36,30 @@ FEATURE_COLS = [
     "combined_score",
     "name_addr_geom"
 ]
+
+
+def label_candidate_pairs(
+    df_features: pd.DataFrame,
+    ground_truth: Dict[str, Set[str]]
+) -> pd.DataFrame:
+    """Attach binary labels without constructing a pandas row object per pair."""
+    required_columns = {"source1_entity_id", "candidate_entity_id"}
+    missing_columns = required_columns - set(df_features.columns)
+    if missing_columns:
+        raise ValueError(f"Missing candidate label columns: {sorted(missing_columns)}")
+
+    df_features["label"] = np.fromiter(
+        (
+            int(candidate_id in ground_truth.get(source_id, ()))
+            for source_id, candidate_id in zip(
+                df_features["source1_entity_id"].to_numpy(),
+                df_features["candidate_entity_id"].to_numpy()
+            )
+        ),
+        dtype=np.int8,
+        count=len(df_features)
+    )
+    return df_features
 
 
 def train_lightgbm_model(

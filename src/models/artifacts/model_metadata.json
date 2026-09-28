@@ -1,12 +1,30 @@
 {
-  "best_tau": 0.9000000000000002,
-  "best_macro_f05": 0.8314296894681755,
-  "precision": 0.9666798107255521,
-  "recall": 0.7002285061411025,
-  "singleton_accuracy": 0.875,
-  "val_sample_size": 2000,
-  "total_sample_size": 10000,
-  "cv_tuning_performed": false,
-  "winning_hyperparams": null,
-  "cv_metrics": null
+  "best_tau": 0.9600000000000004,
+  "country_thresholds": {
+    "India": 0.9600000000000004,
+    "US": 0.9450000000000004
+  },
+  "best_macro_f05": 0.8991713277582092,
+  "precision": 0.9743142077198162,
+  "recall": 0.8011761197075594,
+  "singleton_accuracy": 0.9268132858254495,
+  "val_sample_size": 441365,
+  "total_sample_size": 2206821,
+  "cv_tuning_performed": true,
+  "winning_hyperparams": {
+    "learning_rate": 0.07,
+    "num_leaves": 31,
+    "max_depth": 6,
+    "subsample": 0.8,
+    "colsample_bytree": 0.7,
+    "min_child_samples": 25,
+    "reg_alpha": 0.01,
+    "reg_lambda": 0.1
+  },
+  "cv_metrics": {
+    "best_oof_logloss": 0.03954875702366351,
+    "best_oof_auc": 0.9986651330545306,
+    "n_splits": 5,
+    "winning_config": "Config-4 (Fast Gradient with Feature Subsampling)"
+  }
 }

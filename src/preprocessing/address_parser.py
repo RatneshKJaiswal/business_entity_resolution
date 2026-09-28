@@ -49,7 +49,7 @@ def extract_postal_code(address: str, country: str = "") -> str:
     """
     Extracts postal code based on country format (6-digit India, 5-digit US/France).
     """
-    if not address:
+    if not isinstance(address, str) or not address:
         return ""
     if country == "India":
         m = POSTAL_INDIA.search(address)
@@ -72,7 +72,7 @@ def extract_numbers_and_postal(address: str, country: str = "") -> Tuple[Set[str
     Normalizes street numbers by stripping leading zeros (e.g. 0017560 -> 17560).
     Excludes the postal code from the street numbers set.
     """
-    if not address:
+    if not isinstance(address, str) or not address:
         return set(), ""
     
     postal = extract_postal_code(address, country)
